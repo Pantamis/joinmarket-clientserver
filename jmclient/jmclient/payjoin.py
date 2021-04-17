@@ -1,31 +1,17 @@
-from zope.interface import implementer
-from twisted.internet import reactor, task
-from twisted.web.http import UNAUTHORIZED, BAD_REQUEST, NOT_FOUND
-from twisted.web.client import (Agent, readBody, ResponseFailed,
-                                BrowserLikePolicyForHTTPS)
-from twisted.web.server import Site
-from twisted.web.resource import Resource, ErrorPage
-from twisted.web.iweb import IPolicyForHTTPS
-from twisted.internet.ssl import CertificateOptions
-from twisted.internet.error import ConnectionRefusedError, ConnectionLost
-from twisted.internet.endpoints import TCP4ClientEndpoint, UNIXClientEndpoint
-from twisted.web.http_headers import Headers
-import txtorcon
-from txtorcon.web import tor_agent
-from txtorcon.socks import HostUnreachableError
-import urllib.parse as urlparse
-from urllib.parse import urlencode
+from twisted.internet import reactor
+try:
+    from twisted.internet.ssl import ClientContextFactory
+except ImportError:
+    pass
 import json
-import random
-from io import BytesIO
-from pprint import pformat
-from jmbase import BytesProducer, bintohex, jmprint
+from jmbase import bintohex, jmprint, random_insert
 from .configure import get_log, jm_single
 import jmbitcoin as btc
-from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet, estimate_tx_fee
+from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet
 from .wallet_service import WalletService
 from .taker_utils import direct_send
-from jmclient import RegtestBitcoinCoreInterface, select_one_utxo, process_shutdown
+from jmclient import (select_one_utxo,
+                      process_shutdown, BIP78ClientProtocolFactory)
 
 """
 For some documentation see:
@@ -42,36 +28,6 @@ log = get_log()
 INPUT_VSIZE_LEGACY = 148
 INPUT_VSIZE_SEGWIT_LEGACY = 91
 INPUT_VSIZE_SEGWIT_NATIVE = 68
-
-# txtorcon outputs erroneous warnings about hiddenservice directory strings,
-# annoyingly, so we suppress it here:
-import warnings
-warnings.filterwarnings("ignore")
-
-""" This whitelister allows us to accept any cert for a specific
-    domain, and is to be used for testing only; the default Agent
-    behaviour of twisted.web.client.Agent for https URIs is
-    the correct one in production (i.e. uses local trust store).
-"""
-@implementer(IPolicyForHTTPS)
-class WhitelistContextFactory(object):
-    def __init__(self, good_domains=None):
-        """
-        :param good_domains: List of domains. The URLs must be in bytes
-        """
-        if not good_domains:
-            self.good_domains = []
-        else:
-            self.good_domains = good_domains
-        # by default, handle requests like a browser would
-        self.default_policy = BrowserLikePolicyForHTTPS()
-
-    def creatorForNetloc(self, hostname, port):
-        # check if the hostname is in the the whitelist,
-        # otherwise return the default policy
-        if hostname in self.good_domains:
-            return CertificateOptions(verify=False)
-        return self.default_policy.creatorForNetloc(hostname, port)
 
 class JMPayjoinManager(object):
     """ An encapsulation of state for an
@@ -295,8 +251,10 @@ class JMPayjoinManager(object):
             for j, inp2 in enumerate(ourins):
                 if (inp.prevout.hash, inp.prevout.n) == inp2:
                     found[j] += 1
-                else:
-                    receiver_input_indices.append(i)
+                    break
+            else:
+                receiver_input_indices.append(i)
+        assert len(receiver_input_indices) + len(ourins) == len(in_psbt.unsigned_tx.vin)
 
         if any([f != 1 for f in found]):
             return (False, "Receiver proposed PSBT does not contain our inputs.")
@@ -435,7 +393,7 @@ class JMPayjoinManager(object):
         try:
             my_utxos = self.wallet_service.select_utxos(
                 self.mixdepth, jm_single().DUST_THRESHOLD,
-                select_fn=select_one_utxo)
+                select_fn=select_one_utxo, minconfs=1)
         except Exception as e:
             log.error("Failed to select coins, exception: " + repr(e))
             return False
@@ -517,76 +475,32 @@ def get_max_additional_fee_contribution(manager):
                   "contribution of: " + str(max_additional_fee_contribution))
     return max_additional_fee_contribution
 
-def send_payjoin(manager, accept_callback=None,
-                 info_callback=None, return_deferred=False):
-    """ Given a JMPayjoinManager object `manager`, initialised with the
-    payment request data from the server, use its wallet_service to construct
-    a payment transaction, with coins sourced from mixdepth `mixdepth`,
-    then wait for the server response, parse the PSBT, perform checks and complete sign.
-    The info and accept callbacks are to ask the user to confirm the creation of
-    the original payment transaction (None defaults to terminal/CLI processing),
-    and are as defined in `taker_utils.direct_send`.
-
-    Returns:
-    (True, None) in case of payment setup successful (response will be delivered
-     asynchronously) - the `manager` object can be inspected for more detail.
-    (False, errormsg) in case of failure.
+def make_payment_psbt(manager, accept_callback=None, info_callback=None):
+    """ Creates a valid payment transaction and PSBT for it,
+    and adds it to the JMPayjoinManager instance passed as argument.
+    Wallet should already be synced before calling here.
+    Returns True, None if successful or False, errormsg if not.
     """
-
-    # wallet should already be synced before calling here;
     # we can create a standard payment, but have it returned as a PSBT.
     assert isinstance(manager, JMPayjoinManager)
     assert manager.wallet_service.synced
-    payment_psbt = direct_send(manager.wallet_service, manager.amount, manager.mixdepth,
-                             str(manager.destination), accept_callback=accept_callback,
-                             info_callback=info_callback,
-                             with_final_psbt=True, optin_rbf=True)
+    payment_psbt = direct_send(manager.wallet_service, manager.amount,
+                               manager.mixdepth, str(manager.destination),
+                               accept_callback=accept_callback,
+                               info_callback=info_callback,
+                               with_final_psbt=True, optin_rbf=True)
     if not payment_psbt:
         return (False, "could not create non-payjoin payment")
 
-    # TLS whitelist is for regtest testing, it is treated as hostnames for
-    # which tls certificate verification is ignored.
-    tls_whitelist = None
-    if isinstance(jm_single().bc_interface, RegtestBitcoinCoreInterface):
-        tls_whitelist = [b"127.0.0.1"]
-
     manager.set_payment_tx_and_psbt(payment_psbt)
 
-    # add delayed call to broadcast this after 1 minute
-    manager.timeout_fallback_dc = reactor.callLater(60,
-                                        fallback_nonpayjoin_broadcast,
-                                        b"timeout", manager)
+    return (True, None)
 
-    # Now we send the request to the server, with the encoded
-    # payment PSBT
-
-    # First we create a twisted web Agent object:
-
-    # TODO genericize/move out/use library function:
-    def is_hs_uri(s):
-        x = urlparse.urlparse(s)
-        if x.hostname.endswith(".onion"):
-            return (x.scheme, x.hostname, x.port)
-        return False
-
-    tor_url_data = is_hs_uri(manager.server)
-    if tor_url_data:
-        # note the return value is currently unused here
-        socks5_host = jm_single().config.get("PAYJOIN", "onion_socks5_host")
-        socks5_port = int(jm_single().config.get("PAYJOIN", "onion_socks5_port"))
-        # note: SSL not supported at the moment:
-        torEndpoint = TCP4ClientEndpoint(reactor, socks5_host, socks5_port)
-        agent = tor_agent(reactor, torEndpoint)
-    else:
-        if not tls_whitelist:
-            agent = Agent(reactor)
-        else:
-            agent = Agent(reactor,
-                contextFactory=WhitelistContextFactory(tls_whitelist))
-
-    body = BytesProducer(payment_psbt.to_base64().encode("utf-8"))
-
-    #Set the query parameters for the request:
+def make_payjoin_request_params(manager):
+    """ Returns the query parameters for the request
+    to the payjoin receiver, based on the configuration
+    of the given JMPayjoinManager instance.
+    """
 
     # construct the URI from the given parameters
     pj_version = jm_single().config.getint("PAYJOIN",
@@ -612,27 +526,41 @@ def send_payjoin(manager, accept_callback=None,
     min_fee_rate = float(jm_single().config.get("PAYJOIN", "min_fee_rate"))
     params["minfeerate"] = min_fee_rate
 
-    destination_url = manager.server.encode("utf-8")
-    url_parts = list(urlparse.urlparse(destination_url))
-    url_parts[4] = urlencode(params).encode("utf-8")
-    destination_url = urlparse.urlunparse(url_parts)
-    # TODO what to use as user agent?
-    d = agent.request(b"POST", destination_url,
-        Headers({"User-Agent": ["Twisted Web Client Example"],
-                "Content-Type": ["text/plain"]}),
-        bodyProducer=body)
-    d.addCallback(receive_payjoin_proposal_from_server, manager)
-    # note that the errback (here "noResponse") is *not* triggered
-    # by a server rejection (which is accompanied by a non-200
-    # status code returned), but by failure to communicate.
-    def noResponse(failure):
-        failure.trap(ResponseFailed, ConnectionRefusedError,
-                     HostUnreachableError, ConnectionLost)
-        log.error(failure.value)
-        fallback_nonpayjoin_broadcast(b"connection failed", manager)
-    d.addErrback(noResponse)
-    if return_deferred:
-        return d
+    return params
+
+def send_payjoin(manager, accept_callback=None,
+                 info_callback=None, return_deferred=False):
+    """ Given a JMPayjoinManager object `manager`, initialised with the
+    payment request data from the server, use its wallet_service to construct
+    a payment transaction, with coins sourced from mixdepth `manager.mixdepth`,
+    then wait for the server response, parse the PSBT, perform checks and complete sign.
+    The info and accept callbacks are to ask the user to confirm the creation of
+    the original payment transaction (None defaults to terminal/CLI processing),
+    and are as defined in `taker_utils.direct_send`.
+
+    Returns:
+    (True, None) in case of payment setup successful (response will be delivered
+     asynchronously) - the `manager` object can be inspected for more detail.
+    (False, errormsg) in case of failure.
+    """
+    success, errmsg = make_payment_psbt(manager, accept_callback, info_callback)
+    if not success:
+        return (False, errmsg)
+
+    # add delayed call to broadcast this after 1 minute
+    manager.timeout_fallback_dc = reactor.callLater(60,
+                                        fallback_nonpayjoin_broadcast,
+                                        b"timeout", manager)
+
+    params = make_payjoin_request_params(manager)
+    factory = BIP78ClientProtocolFactory(manager, params,
+        process_payjoin_proposal_from_server, process_error_from_server)
+    h = jm_single().config.get("DAEMON", "daemon_host")
+    p = jm_single().config.getint("DAEMON", "daemon_port")-2000
+    if jm_single().config.get("DAEMON", "use_ssl") != 'false':
+        reactor.connectSSL(h, p, factory, ClientContextFactory())
+    else:
+        reactor.connectTCP(h, p, factory)
     return (True, None)
 
 def fallback_nonpayjoin_broadcast(err, manager):
@@ -661,23 +589,18 @@ def fallback_nonpayjoin_broadcast(err, manager):
     log.info("Payment made without coinjoin. Transaction: ")
     log.info(btc.human_readable_transaction(original_tx))
     manager.set_broadcast(False)
-    if manager.timeout_fallback_dc.active():
+    if manager.timeout_fallback_dc and manager.timeout_fallback_dc.active():
         manager.timeout_fallback_dc.cancel()
     quit()
 
-def receive_payjoin_proposal_from_server(response, manager):
+def process_error_from_server(errormsg, errorcode, manager):
     assert isinstance(manager, JMPayjoinManager)
-    # no attempt at chunking or handling incrementally is needed
-    # here. The body should be a byte string containing the
-    # new PSBT, or a jsonified error page.
-    d = readBody(response)
-    # if the response code is not 200 OK, we must assume payjoin
-    # attempt has failed, and revert to standard payment.
-    if int(response.code) != 200:
-        log.warn("Receiver returned error code: " + str(response.code))
-        d.addCallback(fallback_nonpayjoin_broadcast, manager)
-        return
-    d.addCallback(process_payjoin_proposal_from_server, manager)
+    # payjoin attempt has failed, we revert to standard payment.
+    assert int(errorcode) != 200
+    log.warn("Receiver returned error code: {}, message: {}".format(
+        errorcode, errormsg))
+    fallback_nonpayjoin_broadcast(errormsg.encode("utf-8"), manager)
+    return
 
 def process_payjoin_proposal_from_server(response_body, manager):
     assert isinstance(manager, JMPayjoinManager)
@@ -729,7 +652,7 @@ def process_payjoin_proposal_from_server(response_body, manager):
         log.info("Payjoin transaction broadcast successfully.")
         # if transaction is succesfully broadcast, remove the
         # timeout fallback to avoid confusing error messages:
-        if manager.timeout_fallback_dc.active():
+        if manager.timeout_fallback_dc and manager.timeout_fallback_dc.active():
             manager.timeout_fallback_dc.cancel()
         manager.set_broadcast(True)
     if manager.mode == "command-line" and reactor.running:
@@ -738,99 +661,49 @@ def process_payjoin_proposal_from_server(response_body, manager):
 """ Receiver-specific code
 """
 
-class PayjoinServer(Resource):
-    def __init__(self, wallet_service, mixdepth, destination, amount,
-                 shutdown_callback, info_callback , mode="command-line",
+class PayjoinConverter(object):
+    """ This class is used to encapsulate the objects and operations
+    needed to convert a given payment psbt from a sender, to a payjoin psbt
+    proposal.
+    """
+    def __init__(self, manager, shutdown_callback, info_callback,
                  pj_version = 1):
+        assert isinstance(manager, JMPayjoinManager)
+        self.manager = manager
         self.pj_version = pj_version
-        self.wallet_service = wallet_service
+        self.wallet_service = manager.wallet_service
         # a callback with no arguments and no return value,
         # to take whatever actions are needed when the payment has
         # been received:
         self.shutdown_callback = shutdown_callback
         self.info_callback = info_callback
-        self.manager = JMPayjoinManager(self.wallet_service, mixdepth,
-                                        destination, amount, mode=mode,
-                                        user_info_callback=self.info_callback)
         super().__init__()
 
-    isLeaf = True
-
-    def bip78_error(self, request, error_meaning,
-                    error_code="unavailable", http_code=400):
+    def request_to_psbt(self, payment_psbt_base64, sender_parameters):
+        """ Takes a payment psbt from a sender and their url parameters,
+        and returns a new payment PSBT proposal, assuming all conditions
+        are met.
+        Returns:
+        (False, errormsg, errortype) in case of failure.
+        or:
+        (True, base64_payjoin_psbt) in case of success.
         """
-        See https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#receivers-well-known-errors
-
-        We return, to the sender, stringified json in the body as per the above.
-        In case the error code is "original-psbt-rejected", we do not have
-        any valid payment to broadcast, so we shut down with "not paid".
-        for other cases, we schedule the fallback for 60s from now.
-        """
-
-        request.setResponseCode(http_code)
-        request.setHeader(b"content-type", b"text/html; charset=utf-8")
-        log.debug("Returning an error: " + str(
-            error_code) + ": " + str(error_meaning))
-        if error_code in ["original-psbt-rejected", "version-unsupported"]:
-            # if there is a negotiation failure in the first step, we cannot
-            # know whether the sender client sent a valid non-payjoin or not,
-            # hence the warning below is somewhat ambiguous:
-            log.warn("Negotiation failure. Payment has not yet been made,"
-                     " check wallet.")
-            # shutdown now but wait until response is sent.
-            task.deferLater(reactor, 2.0, self.end_failure)
-        else:
-            reactor.callLater(60.0, fallback_nonpayjoin_broadcast,
-                              error_meaning.encode("utf-8"), self.manager)
-        return json.dumps({"errorCode": error_code,
-                           "message": error_meaning}).encode("utf-8")
-
-    def render_GET(self, request):
-        # can be used e.g. to check if an ephemeral HS is up
-        # on Tor Browser:
-        return "<html>Only for testing.</html>".encode("utf-8")
-
-    def render_POST(self, request):
-        """ The sender will use POST to send the initial
-        payment transaction.
-        """
-        log.debug("The server got this POST request: ")
-        # unfortunately the twisted Request object is not
-        # easily serialized:
-        log.debug(request)
-        log.debug(request.method)
-        log.debug(request.uri)
-        log.debug(request.args)
-        sender_parameters = request.args
-        log.debug(request.path)
-        # defer logging of raw request content:
-        proposed_tx = request.content
-
         # we only support version 1; reject others:
         if not self.pj_version == int(sender_parameters[b'v'][0]):
-            return self.bip78_error(request,
-                "This version of payjoin is not supported. ",
+            return (False, "This version of payjoin is not supported. ",
                 "version-unsupported")
-        if not isinstance(proposed_tx, BytesIO):
-            return self.bip78_error(request, "invalid psbt format",
-                                    "original-psbt-rejected")
-        payment_psbt_base64 = proposed_tx.read()
-        log.debug("request content: " + bintohex(payment_psbt_base64))
         try:
             payment_psbt = btc.PartiallySignedTransaction.from_base64(
             payment_psbt_base64)
         except:
-            return self.bip78_error(request,
-                                    "invalid psbt format",
-                                    "original-psbt-rejected")
+            return (False, "invalid psbt format", "original-psbt-rejected")
 
         try:
             self.manager.set_payment_tx_and_psbt(payment_psbt)
         except Exception:
             # note that Assert errors, Value errors and CheckTransaction errors
             # are all possible, so we catch all exceptions to avoid a crash.
-            return self.bip78_error(request,
-                                    "Proposed initial PSBT does not pass sanity checks.",
+            return (False, "Proposed initial PSBT does not pass sanity checks.",
                                     "original-psbt-rejected")
 
         # if the sender set the additionalfeeoutputindex and maxadditionalfeecontribution
@@ -849,7 +722,7 @@ class PayjoinServer(Resource):
             else:
                 minfeerate = None
         except Exception as e:
-            return self.bip78_error(request, "Invalid request parameters.",
+            return (False, "Invalid request parameters.",
                               "original-psbt-rejected")
 
         # if sender chose a fee output it must be the change output,
@@ -859,11 +732,11 @@ class PayjoinServer(Resource):
         # reduction being not too much, which is checked against minfeerate; if
         # it is too big a reduction, again we fail payjoin.
         if (afoi is not None and mafc is None) or (mafc is not None and afoi is None):
-            return self.bip78_error(request, "Invalid request parameters.",
+            return (False, "Invalid request parameters.",
                               "original-psbt-rejected")
 
         if afoi and not (self.manager.change_out_index == afoi):
-            return self.bip78_error(request, "additionalfeeoutputindex is "
+            return (False, "additionalfeeoutputindex is "
                                     "not the change output. Joinmarket does "
                                     "not currently support this.",
                                     "original-psbt-rejected")
@@ -875,7 +748,7 @@ class PayjoinServer(Resource):
         res = jm_single().bc_interface.testmempoolaccept(bintohex(
             self.manager.payment_tx.serialize()))
         if not res[0]["allowed"]:
-            return self.bip78_error(request, "Proposed transaction was "
+            return (False, "Proposed transaction was "
                                     "rejected from mempool.",
                                     "original-psbt-rejected")
 
@@ -887,14 +760,15 @@ class PayjoinServer(Resource):
 
         receiver_utxos = self.manager.select_receiver_utxos()
         if not receiver_utxos:
-            return self.bip78_error(request,
-                                    "Could not select coins for payjoin",
-                                    "unavailable")
+            return (False, "Could not select coins for payjoin",
+                    "unavailable")
 
         # construct unsigned tx for payjoin-psbt:
         payjoin_tx_inputs = [(x.prevout.hash[::-1],
                     x.prevout.n) for x in payment_psbt.unsigned_tx.vin]
-        payjoin_tx_inputs.extend(receiver_utxos.keys())
+        # See https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#Protocol
+        random_insert(payjoin_tx_inputs, receiver_utxos.keys())
+
         pay_out = {"value": self.manager.pay_out.nValue,
                    "address": str(btc.CCoinAddress.from_scriptPubKey(
                        self.manager.pay_out.scriptPubKey))}
@@ -937,7 +811,7 @@ class PayjoinServer(Resource):
         # First, let's check that the user's requested minfeerate is not higher
         # than the feerate they already chose:
         if minfeerate and minfeerate > self.manager.get_payment_psbt_feerate():
-            return self.bip78_error(request, "Bad request: minfeerate "
+            return (False, "Bad request: minfeerate "
                                     "bigger than original psbt feerate.",
                                     "original-psbt-rejected")
         # set the intended virtual size of our input:
@@ -965,7 +839,7 @@ class PayjoinServer(Resource):
             expected_new_fee_rate = self.manager.initial_psbt.get_fee()/(
                 expected_new_tx_size + vsize)
             if expected_new_fee_rate < minfeerate:
-                return self.bip78_error(request, "Bad request: we cannot "
+                return (False, "Bad request: we cannot "
                                         "achieve minfeerate requested.",
                                         "original-psbt-rejected")
 
@@ -973,11 +847,6 @@ class PayjoinServer(Resource):
         # intended:
         outs[self.manager.change_out_index]["value"] -= our_fee_bump
 
-        # TODO this only works for 2 input transactions, otherwise
-        # reversal [::-1] will not be valid as per BIP78 ordering requirement.
-        # (For outputs, we do nothing since we aren't batching in other payments).
-        if random.random() < 0.5:
-            payjoin_tx_inputs = payjoin_tx_inputs[::-1]
         unsigned_payjoin_tx = btc.mktx(payjoin_tx_inputs, outs,
                                     version=payment_psbt.unsigned_tx.nVersion,
                                     locktime=payment_psbt.unsigned_tx.nLockTime)
@@ -1013,7 +882,6 @@ class PayjoinServer(Resource):
 
         # respect the sender's fixed sequence number, if it was used (we checked
         # in the initial sanity check)
-        # TODO consider RBF if we implement it in Joinmarket payments.
         if self.manager.fixed_sequence_number:
             for inp in unsigned_payjoin_tx.vin:
                 inp.nSequence = self.manager.fixed_sequence_number
@@ -1041,15 +909,14 @@ class PayjoinServer(Resource):
         log.debug("Receiver signing successful. Payjoin PSBT is now:\n{}".format(
             self.wallet_service.human_readable_psbt(receiver_signed_psbt)))
         # construct txoutset for the wallet service callback; we cannot use
-        # txid as we don't have all signatures.
+        # txid as we don't have all signatures (TODO: ? but segwit only? even so,
+        # works anyway).
         txinfo = tuple((
             x.scriptPubKey, x.nValue) for x in receiver_signed_psbt.unsigned_tx.vout)
         self.wallet_service.register_callbacks([self.end_receipt],
             txinfo =txinfo,
             cb_type="unconfirmed")
-        content = receiver_signed_psbt.to_base64()
-        request.setHeader(b"content-length", ("%d" % len(content)).encode("ascii"))
-        return content.encode("ascii")
+        return (True, receiver_signed_psbt.to_base64(), None)
 
     def end_receipt(self, txd, txid):
         if self.manager.mode == "gui":
@@ -1057,19 +924,11 @@ class PayjoinServer(Resource):
                                "view wallet tab for update.:FINAL")
         else:
             self.info_callback("Transaction seen on network: " + txid)
-        # do end processing of calling object (e.g. Tor disconnect)
+        # in some cases (GUI) a notification of HS end is needed:
         self.shutdown_callback()
         # informs the wallet service transaction monitor
         # that the transaction has been processed:
         return True
-
-    def end_failure(self):
-        shutdown_msg = "Shutting down, payjoin negotiation failed."
-        if self.manager.mode == "gui":
-            shutdown_msg += "\nCheck wallet tab for payment."
-            shutdown_msg += ":FINAL"
-        self.info_callback(shutdown_msg)
-        self.shutdown_callback()
 
 class JMBIP78ReceiverManager(object):
     """ A class to encapsulate receiver construction
@@ -1101,11 +960,34 @@ class JMBIP78ReceiverManager(object):
             self.uri_created_callback = self.info_callback
         else:
             self.uri_created_callback = uri_created_callback
-        # This callback used by GUI as a signal that it can
+        # This callback is used by GUI as a signal that it can
         # signal the user that the dialog is close-able:
         self.shutdown_callback = shutdown_callback
         self.receiving_address = None
         self.mode = mode
+        self.get_receiving_address()
+        self.manager = JMPayjoinManager(wallet_service, mixdepth,
+                                        self.receiving_address, amount,
+                                        mode=mode,
+                                        user_info_callback=self.info_callback)
+
+    def initiate(self):
+        """ Called at reactor start to start up hidden service
+        and provide uri string to sender.
+        """
+        # Note that we don't pass a "failure_callback" to the BIP78
+        # Protocol; because the only failure is that the payment
+        # HTTP request simply doesn't arrive. Note also that the
+        # "params" argument is None as this is only learnt from request.
+        factory = BIP78ClientProtocolFactory(self, None,
+                self.receive_proposal_from_sender, None,
+                mode="receiver")
+        h = jm_single().config.get("DAEMON", "daemon_host")
+        p = jm_single().config.getint("DAEMON", "daemon_port")-2000
+        if jm_single().config.get("DAEMON", "use_ssl") != 'false':
+            reactor.connectSSL(h, p, factory, ClientContextFactory())
+        else:
+            reactor.connectTCP(h, p, factory)
 
     def default_info_callback(self, msg):
         jmprint(msg)
@@ -1118,48 +1000,17 @@ class JMBIP78ReceiverManager(object):
         self.receiving_address = btc.CCoinAddress(
             self.wallet_service.get_internal_addr(next_mixdepth))
 
-    def start_pj_server_and_tor(self):
-        """ Packages the startup of the receiver side.
+    def receive_proposal_from_sender(self, body, params):
+        """ Accepts the contents of the HTTP request from the sender
+        and returns a payjoin proposal, or an error.
         """
-        self.get_receiving_address()
-        self.pj_server = PayjoinServer(self.wallet_service, self.mixdepth,
-                            self.receiving_address, self.amount,
-                            self.shutdown, self.info_callback, mode=self.mode)
-        self.site = Site(self.pj_server)
-        self.site.displayTracebacks = False
-        self.info_callback("Attempting to start onion service on port: " + str(
-            self.port) + " ...")
-        self.start_tor()
-
-    def setup_failed(self, arg):
-        errmsg = "Setup failed: " + str(arg)
-        log.error(errmsg)
-        self.info_callback(errmsg)
-        process_shutdown()
-
-    def create_onion_ep(self, t):
-        self.tor_connection = t
-        return t.create_onion_endpoint(self.port)
-
-    def onion_listen(self, onion_ep):
-        return onion_ep.listen(self.site)
-
-    def print_host(self, ep):
-        """ Callback fired once the HS is available;
-        receiver user needs a BIP21 URI to pass to
-        the sender:
-        """
-        self.info_callback("Your hidden service is available. Please\n"
-                           "now pass this URI string to the sender to\n"
-                           "effect the payjoin payment:")
-        # Note that ep,getHost().onion_port must return the same
-        # port as we chose in self.port; if not there is an error.
-        assert ep.getHost().onion_port == self.port
-        self.uri_created_callback(self.bip21_uri_from_onion_hostname(
-            str(ep.getHost().onion_uri)))
-        if self.mode == "command-line":
-            self.info_callback("Keep this process running until the payment "
-                           "is received.")
+        self.pj_converter = PayjoinConverter(self.manager,
+                            self.shutdown, self.info_callback)
+        success, a, b = self.pj_converter.request_to_psbt(body, params)
+        if not success:
+            return (False, a, b)
+        else:
+            return (True, a)
 
     def bip21_uri_from_onion_hostname(self, host):
         """ Encoding the BIP21 URI according to BIP78 specifications,
@@ -1172,33 +1023,30 @@ class JMBIP78ReceiverManager(object):
         full_pj_string = "http://" + host + port_str
         bip78_btc_amount = btc.amount_to_btc(btc.amount_to_sat(self.amount))
         # "safe" option is required to encode url in url unmolested:
-        return btc.encode_bip21_uri(str(self.receiving_address),
+        bip21_uri = btc.encode_bip21_uri(str(self.receiving_address),
                                 {"amount": bip78_btc_amount,
                                  "pj": full_pj_string.encode("utf-8")},
                                 safe=":/")
-
-    def start_tor(self):
-        """ This function executes the workflow
-        of starting the hidden service and returning/
-        printing the BIP21 URI:
-        """
-        control_host = jm_single().config.get("PAYJOIN", "tor_control_host")
-        control_port = int(jm_single().config.get("PAYJOIN", "tor_control_port"))
-        if str(control_host).startswith('unix:'):
-            control_endpoint = UNIXClientEndpoint(reactor, control_host[5:])
-        else:
-            control_endpoint = TCP4ClientEndpoint(reactor, control_host, control_port)
-        d = txtorcon.connect(reactor, control_endpoint)
-        d.addCallback(self.create_onion_ep)
-        d.addErrback(self.setup_failed)
-        # TODO: add errbacks to the next two calls in
-        # the chain:
-        d.addCallback(self.onion_listen)
-        d.addCallback(self.print_host)
+        self.info_callback("Your hidden service is available. Please\n"
+                                   "now pass this URI string to the sender to\n"
+                                   "effect the payjoin payment:")
+        self.uri_created_callback(bip21_uri)
+        if self.mode == "command-line":
+            self.info_callback("Keep this process running until the payment "
+                               "is received.")
 
     def shutdown(self):
-        self.tor_connection.protocol.transport.loseConnection()
+        """ Triggered when processing has completed successfully
+        or failed, receiver side.
+        """
         process_shutdown(self.mode)
+        # on receiver side, if we are part of a long running
+        # process (meaning above process_shutdown is a no-op),
+        # we need to abandon the delayed call (this is the normal
+        # success case):
+        tfdc = self.manager.timeout_fallback_dc
+        if tfdc and tfdc.active():
+            tfdc.cancel()
         self.info_callback("Hidden service shutdown complete")
         if self.shutdown_callback:
             self.shutdown_callback()

@@ -146,12 +146,7 @@ def bip32pathparse(path):
         ret_elements.append(x)
     return ret_elements
 
-def test_bip32_pathparse():
-    assert bip32pathparse("m/2/1/0017")
-    assert not bip32pathparse("n/1/1/1/1")
-    assert bip32pathparse("m/0/1'/100'/3'/2/2/21/004/005")
-    assert not bip32pathparse("m/0/0/00k")
-    return True
+
 """
 WalletView* classes manage wallet representations.
 """
@@ -301,7 +296,11 @@ class WalletView(WalletViewBase):
 
     def serialize(self, entryseparator="\n", summarize=False):
         header = self.wallet_name
-        footer = "Total balance:" + self.separator + self.get_fmt_balance()
+        if len(self.accounts) > 1:
+            footer = "Total balance:" + self.separator + \
+                self.get_fmt_balance()
+        else:
+            footer = ""
         if summarize:
             return self.serclass(entryseparator.join([header] + [
                 x.serialize("", summarize=True) for x in self.accounts] + [footer]))
@@ -310,11 +309,12 @@ class WalletView(WalletViewBase):
                 x.serialize(entryseparator, summarize=False) for x in self.accounts] + [footer]))
 
 
-def get_tx_info(txid):
+def get_tx_info(txid, tx_cache=None):
     """
     Retrieve some basic information about the given transaction.
 
     :param txid: txid as hex-str
+    :param tx_cache: optional cache (dictionary) for get_transaction results
     :return: tuple
         is_coinjoin: bool
         cj_amount: int, only useful if is_coinjoin==True
@@ -323,7 +323,12 @@ def get_tx_info(txid):
         blocktime: int, blocktime this tx was mined
         txd: deserialized transaction object (hex-encoded data)
     """
-    rpctx = jm_single().bc_interface.get_transaction(txid)
+    if tx_cache is not None and txid in tx_cache:
+        rpctx = tx_cache[txid]
+    else:
+        rpctx = jm_single().bc_interface.get_transaction(txid)
+        if tx_cache is not None:
+            tx_cache[txid] = rpctx
     txhex = str(rpctx['hex'])
     tx = btc.CMutableTransaction.deserialize(hextobin(txhex))
     output_script_values = {x.scriptPubKey: x.nValue for x in tx.vout}
@@ -404,7 +409,7 @@ def wallet_showutxos(wallet_service, showprivkey):
 
 
 def wallet_display(wallet_service, showprivkey, displayall=False,
-        serialized=True, summarized=False):
+        serialized=True, summarized=False, mixdepth=None):
     """build the walletview object,
     then return its serialization directly if serialized,
     else return the WalletView object.
@@ -445,7 +450,11 @@ def wallet_display(wallet_service, showprivkey, displayall=False,
     # TODO - either optionally not show disabled utxos, or
     # mark them differently in display (labels; colors)
     utxos = wallet_service.get_utxos_by_mixdepth(include_disabled=True)
-    for m in range(wallet_service.mixdepth + 1):
+    if mixdepth:
+        md_range = range(mixdepth, mixdepth + 1)
+    else:
+        md_range = range(wallet_service.mixdepth + 1)
+    for m in md_range:
         branchlist = []
         for address_type in [BaseWallet.ADDRESS_TYPE_EXTERNAL,
                              BaseWallet.ADDRESS_TYPE_INTERNAL]:
@@ -490,7 +499,7 @@ def wallet_display(wallet_service, showprivkey, displayall=False,
                     timelock = datetime.utcfromtimestamp(path[-1])
 
                     balance = sum([utxodata["value"] for utxo, utxodata in
-                        iteritems(utxos[m]) if path == utxodata["path"]])
+                        utxos[m].items() if path == utxodata["path"]])
                     status = timelock.strftime("%Y-%m-%d") + " [" + (
                         "LOCKED" if datetime.now() < timelock else "UNLOCKED") + "]"
                     privkey = ""
@@ -518,22 +527,21 @@ def wallet_display(wallet_service, showprivkey, displayall=False,
 
                 privkey, engine = wallet_service._get_key_from_path(path)
                 pubkey = engine.privkey_to_pubkey(privkey)
-                pubkeyhash = btc.bin_hash160(pubkey)
+                pubkeyhash = btc.Hash160(pubkey)
                 output = "BURN-" + binascii.hexlify(pubkeyhash).decode()
 
                 balance = 0
                 status = "no transaction"
                 if path_repr_b in burner_outputs:
                     txhex, blockheight, merkle_branch, blockindex = burner_outputs[path_repr_b]
-                    txhex = binascii.hexlify(txhex).decode()
-                    txd = btc.deserialize(txhex)
-                    assert len(txd["outs"]) == 1
-                    balance = txd["outs"][0]["value"]
-                    script = binascii.unhexlify(txd["outs"][0]["script"])
+                    txd = btc.CMutableTransaction.deserialize(txhex)
+                    assert len(txd.vout) == 1
+                    balance = txd.vout[0].nValue
+                    script = txd.vout[0].scriptPubKey
                     assert script[0] == 0x6a #OP_RETURN
                     tx_pubkeyhash = script[2:]
                     assert tx_pubkeyhash == pubkeyhash
-                    status = btc.txhash(txhex) + (" [NO MERKLE PROOF]" if
+                    status = bintohex(txd.GetTxid()) + (" [NO MERKLE PROOF]" if
                         merkle_branch == FidelityBondMixin.MERKLE_BRANCH_UNAVAILABLE else "")
                 privkey = (wallet_service.get_wif_path(path) if showprivkey else "")
                 if displayall or balance > 0:
@@ -790,9 +798,10 @@ def wallet_fetch_history(wallet, options):
     deposits = []
     deposit_times = []
     tx_number = 0
+    tx_cache = {}
     for tx in txes:
         is_coinjoin, cj_amount, cj_n, output_script_values, blocktime, txd =\
-            get_tx_info(hextobin(tx['txid']))
+            get_tx_info(hextobin(tx['txid']), tx_cache=tx_cache)
 
         # unconfirmed transactions don't have blocktime, get_tx_info() returns
         # 0 in that case
@@ -803,8 +812,12 @@ def wallet_fetch_history(wallet, options):
 
         rpc_inputs = []
         for ins in txd.vin:
-            wallet_tx = jm_single().bc_interface.get_transaction(
-                ins.prevout.hash[::-1])
+            if ins.prevout.hash[::-1] in tx_cache:
+                wallet_tx = tx_cache[ins.prevout.hash[::-1]]
+            else:
+                wallet_tx = jm_single().bc_interface.get_transaction(
+                    ins.prevout.hash[::-1])
+                tx_cache[ins.prevout.hash[::-1]] = wallet_tx
             if wallet_tx is None:
                 continue
             inp = btc.CMutableTransaction.deserialize(hextobin(
@@ -1049,7 +1062,17 @@ def wallet_dumpprivkey(wallet, hdpath):
     return wallet.get_wif_path(path)  # will raise exception on invalid path
 
 
-def wallet_signmessage(wallet, hdpath, message):
+def wallet_signmessage(wallet, hdpath, message, out_str=True):
+    """ Given a wallet, a BIP32 HD path (as can be output
+    from the display method) and a message string, returns
+    a base64 encoded signature along with the corresponding
+    address and message.
+    If `out_str` is True, returns human readable representation,
+    otherwise returns tuple of (signature, message, address).
+    """
+    if not get_network() == "mainnet":
+        return "Error: message signing is only supported on mainnet."
+
     msg = message.encode('utf-8')
 
     if not hdpath:
@@ -1059,8 +1082,12 @@ def wallet_signmessage(wallet, hdpath, message):
 
     path = wallet.path_repr_to_path(hdpath)
     sig = wallet.sign_message(msg, path)
-    retval = "Signature: {}\nTo verify this in Bitcoin Core".format(sig)
-    return retval + " use the RPC command 'verifymessage'"
+    addr = wallet.get_address_from_path(path)
+    if not out_str:
+        return (sig, message, addr)
+    return ("Signature: {}\nMessage: {}\nAddress: {}\n"
+    "To verify this in Electrum use Tools->Sign/verify "
+    "message.".format(sig, message, addr))
 
 def wallet_signpsbt(wallet_service, psbt):
     if not psbt:
@@ -1490,12 +1517,14 @@ def wallet_tool_main(wallet_root_path):
 
     #Now the wallet/data is prepared, execute the script according to the method
     if method == "display":
-        return wallet_display(wallet_service, options.showprivkey)
+        return wallet_display(wallet_service, options.showprivkey,
+            mixdepth=options.mixdepth)
     elif method == "displayall":
         return wallet_display(wallet_service, options.showprivkey,
-                              displayall=True)
+            displayall=True, mixdepth=options.mixdepth)
     elif method == "summary":
-        return wallet_display(wallet_service, options.showprivkey, summarized=True)
+        return wallet_display(wallet_service, options.showprivkey,
+            summarized=True, mixdepth=options.mixdepth)
     elif method == "history":
         if not isinstance(jm_single().bc_interface, BitcoinCoreInterface):
             jmprint('showing history only available when using the Bitcoin Core ' +
@@ -1558,29 +1587,4 @@ def wallet_tool_main(wallet_root_path):
     else:
         parser.error("Unknown wallet-tool method: " + method)
         sys.exit(EXIT_ARGERROR)
-
-
-#Testing (can port to test modules, TODO)
-if __name__ == "__main__":
-    if not test_bip32_pathparse():
-        sys.exit(EXIT_FAILURE)
-    rootpath="m/0"
-    walletbranch = 0
-    accounts = range(3)
-    acctlist = []
-    for a in accounts:
-        branches = []
-        for address_type in range(2):
-            entries = []
-            for i in range(4):
-                entries.append(WalletViewEntry(rootpath, a, address_type,
-                                       i, "DUMMYADDRESS"+str(i+a),
-                                       [i*10000000, i*10000000]))
-            branches.append(WalletViewBranch(rootpath,
-                                            a, address_type, branchentries=entries,
-                                            xpub="xpubDUMMYXPUB"+str(a+address_type)))
-        acctlist.append(WalletViewAccount(rootpath, a, branches=branches))
-    wallet = WalletView(rootpath + "/" + str(walletbranch),
-                             accounts=acctlist)
-    jmprint(wallet.serialize(), "success")
 

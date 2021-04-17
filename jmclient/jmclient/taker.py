@@ -548,12 +548,6 @@ class Taker(object):
         jlog.info('obtained tx\n' + btc.human_readable_transaction(
             self.latest_tx))
 
-        for index, ins in enumerate(self.latest_tx.vin):
-            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
-            if utxo not in self.input_utxos.keys():
-                continue
-            # placeholders required
-            ins.scriptSig = btc.CScript.fromhex("deadbeef")
         self.taker_info_callback("INFO", "Built tx, sending to counterparties.")
         return (True, list(self.maker_utxo_data.keys()),
                 bintohex(self.latest_tx.serialize()))
@@ -595,10 +589,9 @@ class Taker(object):
         utxo = {}
         ctr = 0
         for index, ins in enumerate(self.latest_tx.vin):
-            utxo_for_checking = (ins.prevout.hash[::-1], ins.prevout.n)
-             # 'deadbeef' markers mean our own input scripts are not queried
-            if ins.scriptSig != b"":
+            if self._is_our_input(ins) or ins.scriptSig != b"":
                 continue
+            utxo_for_checking = (ins.prevout.hash[::-1], ins.prevout.n)
             utxo[ctr] = [index, utxo_for_checking]
             ctr += 1
         utxo_data = jm_single().bc_interface.query_utxo_set([x[
@@ -689,9 +682,10 @@ class Taker(object):
             # other guy sent a failed signature
 
         tx_signed = True
-        for input, witness in zip(self.latest_tx.vin, self.latest_tx.wit.vtxinwit):
-            if input.scriptSig == b"" \
-               and witness == btc.CTxInWitness(btc.CScriptWitness([])):
+        for ins, witness in zip(self.latest_tx.vin, self.latest_tx.wit.vtxinwit):
+            if ins.scriptSig == b"" \
+                    and not self._is_our_input(ins) \
+                    and witness == btc.CTxInWitness(btc.CScriptWitness([])):
                 tx_signed = False
         if not tx_signed:
             return False
@@ -748,7 +742,6 @@ class Taker(object):
             return priv_utxo_pairs, too_old, too_small
 
         commit_type_byte = "P"
-        podle_data = None
         tries = jm_single().config.getint("POLICY", "taker_utxo_retries")
         age = jm_single().config.getint("POLICY", "taker_utxo_age")
         #Minor rounding errors don't matter here
@@ -757,24 +750,11 @@ class Taker(object):
                                             "taker_utxo_amtpercent") / 100.0)
         priv_utxo_pairs, to, ts = priv_utxo_pairs_from_utxos(self.input_utxos,
                                                              age, amt)
-        #Note that we ignore the "too old" and "too small" lists in the first
-        #pass through, because the same utxos appear in the whole-wallet check.
 
         #For podle data format see: podle.PoDLE.reveal()
         #In first round try, don't use external commitments
         podle_data = generate_podle(priv_utxo_pairs, tries)
         if not podle_data:
-            #We defer to a second round to try *all* utxos in wallet;
-            #this is because it's much cleaner to use the utxos involved
-            #in the transaction, about to be consumed, rather than use
-            #random utxos that will persist after. At this step we also
-            #allow use of external utxos in the json file.
-            if any(self.wallet_service.get_utxos_by_mixdepth().values()):
-                utxos = {}
-                for mdutxo in self.wallet_service.get_utxos_by_mixdepth().values():
-                    utxos.update(mdutxo)
-                priv_utxo_pairs, to, ts = priv_utxo_pairs_from_utxos(
-                    utxos, age, amt)
             #Pre-filter the set of external commitments that work for this
             #transaction according to its size and age.
             dummy, extdict = get_podle_commitments()
@@ -783,7 +763,18 @@ class Taker(object):
                     list(extdict.keys()), age, amt)
             else:
                 ext_valid = None
-            podle_data = generate_podle(priv_utxo_pairs, tries, ext_valid)
+            #We defer to a second round to try *all* utxos in spending mixdepth;
+            #this is because it's much cleaner to use the utxos involved
+            #in the transaction, about to be consumed, rather than use
+            #random utxos that will persist after. At this step we also
+            #allow use of external utxos in the json file.
+            mixdepth_utxos = self.wallet_service.get_utxos_by_mixdepth()[self.mixdepth]
+            if len(self.input_utxos) == len(mixdepth_utxos):
+                # Already tried the whole mixdepth
+                podle_data = generate_podle([], tries, ext_valid)
+            else:
+                priv_utxo_pairs, to, ts = priv_utxo_pairs_from_utxos(mixdepth_utxos, age, amt)
+                podle_data = generate_podle(priv_utxo_pairs, tries, ext_valid)
         if podle_data:
             jlog.debug("Generated PoDLE: " + repr(podle_data))
             return (commit_type_byte + bintohex(podle_data.commitment),
@@ -814,9 +805,9 @@ class Taker(object):
         # now sign it ourselves
         our_inputs = {}
         for index, ins in enumerate(self.latest_tx.vin):
-            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
-            if utxo not in self.input_utxos.keys():
+            if not self._is_our_input(ins):
                 continue
+            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
             self.latest_tx.vin[index].scriptSig = btc.CScript(b'')
             script = self.input_utxos[utxo]['script']
             amount = self.input_utxos[utxo]['value']
@@ -945,6 +936,10 @@ class Taker(object):
         self.on_finished_callback(True, fromtx=fromtx, waittime=waittime,
                                   txdetails=(txd, txid))
         return True
+
+    def _is_our_input(self, tx_input):
+        utxo = (tx_input.prevout.hash[::-1], tx_input.prevout.n)
+        return utxo in self.input_utxos
 
 def round_to_significant_figures(d, sf):
     '''Rounding number d to sf significant figures in base 10'''

@@ -14,29 +14,16 @@ import hashlib
 import os
 import sys
 from jmbase import (get_log, EXIT_FAILURE, hextobin, bintohex,
-                    utxo_to_utxostr)
+                    utxo_to_utxostr, bdict_sdict_convert)
 from jmclient import (jm_single, get_irc_mchannels,
-                      RegtestBitcoinCoreInterface)
+                      RegtestBitcoinCoreInterface,
+                      SNICKERReceiver, process_shutdown)
 import jmbitcoin as btc
 
 
 jlog = get_log()
 
-class JMProtocolError(Exception):
-    pass
-
-class JMClientProtocol(amp.AMP):
-    def __init__(self, factory, client, nick_priv=None):
-            self.client = client
-            self.factory = factory
-            if not nick_priv:
-                self.nick_priv = hashlib.sha256(
-                    os.urandom(16)).digest() + b"\x01"
-            else:
-                self.nick_priv = nick_priv
-
-            self.shutdown_requested = False
-
+class BaseClientProtocol(amp.AMP):
     def checkClientResponse(self, response):
         """A generic check of client acceptance; any failure
         is considered criticial.
@@ -53,6 +40,242 @@ class JMClientProtocol(amp.AMP):
     def defaultCallbacks(self, d):
         d.addCallback(self.checkClientResponse)
         d.addErrback(self.defaultErrback)
+
+class JMProtocolError(Exception):
+    pass
+
+class BIP78ClientProtocol(BaseClientProtocol):
+
+    def __init__(self, manager, params,
+                 success_callback, failure_callback,
+                 tls_whitelist=[], mode="sender"):
+        self.manager = manager
+        # can be "sender" or "receiver"
+        self.mode = mode
+        self.success_callback = success_callback
+        self.failure_callback = failure_callback
+        if self.mode == "sender":
+            self.params = params
+        else:
+            # receiver only learns params from request
+            self.params = None
+        if len(tls_whitelist) == 0:
+            if isinstance(jm_single().bc_interface,
+                          RegtestBitcoinCoreInterface):
+                tls_whitelist = ["127.0.0.1"]
+        self.tls_whitelist = tls_whitelist
+
+    def connectionMade(self):
+        jcg = jm_single().config.get
+        if self.mode == "sender":
+            netconfig = {"socks5_host": jcg("PAYJOIN", "onion_socks5_host"),
+                         "socks5_port": jcg("PAYJOIN", "onion_socks5_port"),
+                         "tls_whitelist": ",".join(self.tls_whitelist),
+                         "servers": [self.manager.server]}
+            d = self.callRemote(commands.BIP78SenderInit,
+                                netconfig=json.dumps(netconfig))
+        else:
+            netconfig = {"port": 80,
+                         "tor_control_host": jcg("PAYJOIN", "tor_control_host"),
+                         "tor_control_port": jcg("PAYJOIN", "tor_control_port")}
+            d = self.callRemote(commands.BIP78ReceiverInit,
+                                netconfig=json.dumps(netconfig))
+        self.defaultCallbacks(d)
+
+    @commands.BIP78ReceiverUp.responder
+    def on_BIP78_RECEIVER_UP(self, hostname):
+        self.manager.bip21_uri_from_onion_hostname(hostname)
+        return {"accepted": True}
+
+    @commands.BIP78ReceiverOriginalPSBT.responder
+    def on_BIP78_RECEIVER_ORIGINAL_PSBT(self, body, params):
+        params = json.loads(params)
+        # TODO: we don't need binary key/vals client side, but will have to edit
+        # PayjoinConverter for that:
+        retval = self.success_callback(body.encode("utf-8"), bdict_sdict_convert(
+            params, output_binary=True))
+        if not retval[0]:
+            d = self.callRemote(commands.BIP78ReceiverSendError, errormsg=retval[1],
+                                errorcode=retval[2])
+        else:
+            d = self.callRemote(commands.BIP78ReceiverSendProposal, psbt=retval[1])
+        self.defaultCallbacks(d)
+        return {"accepted": True}
+
+    @commands.BIP78ReceiverHiddenServiceShutdown.responder
+    def on_BIP78_RECEIVER_HIDDEN_SERVICE_SHUTDOWN(self):
+        """ This is called when the daemon has shut down the HS
+        because of an invalid message/error. An earlier message
+        will have conveyed the reason for the error.
+        """
+        self.manager.shutdown()
+        return {"accepted": True}
+
+    @commands.BIP78ReceiverOnionSetupFailed.responder
+    def on_BIP78_RECEIVER_ONION_SETUP_FAILED(self, reason):
+        self.manager.info_callback(reason)
+        self.manager.shutdown()
+        return {"accepted": True}
+
+    @commands.BIP78SenderUp.responder
+    def on_BIP78_SENDER_UP(self):
+        d = self.callRemote(commands.BIP78SenderOriginalPSBT,
+                            body=self.manager.initial_psbt.to_base64(),
+                            params=json.dumps(self.params))
+        self.defaultCallbacks(d)
+        return {"accepted": True}
+
+    @commands.BIP78SenderReceiveProposal.responder
+    def on_BIP78_SENDER_RECEIVE_PROPOSAL(self, psbt):
+        self.success_callback(psbt, self.manager)
+        return {"accepted": True}
+
+    @commands.BIP78SenderReceiveError.responder
+    def on_BIP78_SENDER_RECEIVER_ERROR(self, errormsg, errorcode):
+        self.failure_callback(errormsg, errorcode, self.manager)
+        return {"accepted": True}
+
+    @commands.BIP78InfoMsg.responder
+    def on_BIP78_INFO_MSG(self, infomsg):
+        self.manager.info_callback(infomsg)
+        return {"accepted": True}
+
+class SNICKERClientProtocol(BaseClientProtocol):
+
+    def __init__(self, client, servers, tls_whitelist=[], oneshot=False):
+        # if client is type JMSNICKERReceiver, this will flag
+        # the use of the receiver workflow (polling loop).
+        # Otherwise it is assumed to be a proposer workloop,
+        # which does not have active polling, but only the
+        # ability to upload when clients call for it.
+        self.client = client
+        self.servers = servers
+        if len(tls_whitelist) == 0:
+            if isinstance(jm_single().bc_interface,
+                          RegtestBitcoinCoreInterface):
+                tls_whitelist = ["127.0.0.1"]
+        self.tls_whitelist = tls_whitelist
+        self.processed_proposals = []
+        self.oneshot = oneshot
+
+    def connectionMade(self):
+        netconfig = {"socks5_host": jm_single().config.get("PAYJOIN", "onion_socks5_host"),
+                     "socks5_port": jm_single().config.get("PAYJOIN", "onion_socks5_port"),
+                     "servers": self.servers,
+                     "tls_whitelist": ",".join(self.tls_whitelist),
+                     "filterconfig": "",
+                     "credentials": ""}
+
+        if isinstance(self.client, SNICKERReceiver):
+            d = self.callRemote(commands.SNICKERReceiverInit,
+                                netconfig=json.dumps(netconfig))
+        else:
+            d = self.callRemote(commands.SNICKERProposerInit,
+                                netconfig=json.dumps(netconfig))
+            self.defaultCallbacks(d)
+
+    def shutdown(self):
+        """ Encapsulates shut down actions.
+        """
+        if self.proposal_poll_loop:
+            self.proposals_poll_loop.stop()
+
+    def poll_for_proposals(self):
+        """ May be invoked in a LoopingCall or other
+        event loop.
+        Retrieves any entries in the proposals_source, then
+        compares with existing,
+        and invokes parse_proposal on all new entries.
+        # TODO considerable thought should go into how to store
+        proposals cross-runs, and also handling of keys, which
+        must be optional.
+        """
+        # always check whether the service is still intended to
+        # be active, before starting the polling actions:
+        if jm_single().config.get("SNICKER", "enabled") != "true":
+            self.shutdown()
+            return
+        d = self.callRemote(commands.SNICKERReceiverGetProposals)
+        self.defaultCallbacks(d)
+
+    @commands.SNICKERProposerUp.responder
+    def on_SNICKER_PROPOSER_UP(self):
+        jlog.info("SNICKER proposer daemon ready.")
+        # TODO handle multiple servers correctly
+        for s in self.servers:
+            if s == "":
+                continue
+            d = self.callRemote(commands.SNICKERRequestPowTarget,
+                                server=s)
+            self.defaultCallbacks(d)
+        return {"accepted": True}
+
+    @commands.SNICKERReceivePowTarget.responder
+    def on_SNICKER_RECEIVE_POW_TARGET(self, server, targetbits):
+        proposals = self.client.get_proposals(targetbits)
+        d = self.callRemote(commands.SNICKERProposerPostProposals,
+            proposals="\n".join([x.decode("utf-8") for x in proposals]),
+            server = server)
+        self.defaultCallbacks(d)
+        return {"accepted": True}
+
+    @commands.SNICKERServerError.responder
+    def on_SNICKER_SERVER_ERROR(self, server, errorcode):
+        self.client.info_callback("Server: " + str(
+        server) + " returned error code: " + str(errorcode))
+        return {"accepted": True}
+
+    @commands.SNICKERReceiverUp.responder
+    def on_SNICKER_RECEIVER_UP(self):
+        if self.oneshot:
+            jlog.info("Starting single query to SNICKER server(s).")
+            reactor.callLater(0.0, self.poll_for_proposals)
+        else:
+            jlog.info("Starting SNICKER polling loop")
+            self.proposal_poll_loop = task.LoopingCall(
+                self.poll_for_proposals)
+            poll_interval = int(60.0 * float(
+                jm_single().config.get("SNICKER", "polling_interval_minutes")))
+            self.proposal_poll_loop.start(poll_interval, now=False)
+        return {"accepted": True}
+
+    @commands.SNICKERReceiverProposals.responder
+    def on_SNICKER_RECEIVER_PROPOSALS(self, proposals, server):
+        """ Just passes through the proposals retrieved from
+        any server, to the SNICKERReceiver client object, asynchronously.
+        The proposals data must be newline separated.
+        """
+        try:
+            proposals = proposals.split("\n")
+        except:
+            jlog.warn("Error in parsing proposals from server: " + str(server))
+            return {"accepted": True}
+        reactor.callLater(0.0, self.process_proposals, proposals)
+        return {"accepted": True}
+
+    def process_proposals(self, proposals):
+        self.client.process_proposals(proposals)
+        if self.oneshot:
+            process_shutdown()
+
+    @commands.SNICKERProposalsServerResponse.responder
+    def on_SNICKER_PROPOSALS_SERVER_RESPONSE(self, response, server):
+        self.client.info_callback("Response from server: " + str(server) +\
+                                  " was: " + str(response))
+        self.client.end_requests_callback(None)
+        return {"accepted": True}
+
+class JMClientProtocol(BaseClientProtocol):
+    def __init__(self, factory, client, nick_priv=None):
+            self.client = client
+            self.factory = factory
+            if not nick_priv:
+                self.nick_priv = hashlib.sha256(
+                    os.urandom(16)).digest() + b"\x01"
+            else:
+                self.nick_priv = nick_priv
+
+            self.shutdown_requested = False
 
     def connectionMade(self):
         jlog.debug('connection was made, starting client.')
@@ -499,6 +722,33 @@ class JMTakerClientProtocol(JMClientProtocol):
                             txhex=str(txhex_to_push))
         self.defaultCallbacks(d)
 
+class SNICKERClientProtocolFactory(protocol.ClientFactory):
+    protocol = SNICKERClientProtocol
+    def buildProtocol(self, addr):
+        return self.protocol(self.client, self.servers, oneshot=self.oneshot)
+    def __init__(self, client, servers, oneshot=False):
+        self.client = client
+        self.servers = servers
+        self.oneshot = oneshot
+
+class BIP78ClientProtocolFactory(protocol.ClientFactory):
+    protocol = BIP78ClientProtocol
+    def buildProtocol(self, addr):
+        return self.protocol(self.manager, self.params,
+                    self.success_callback,
+                    self.failure_callback,
+                    tls_whitelist=self.tls_whitelist,
+                    mode=self.mode)
+    def __init__(self, manager, params, success_callback,
+                 failure_callback, tls_whitelist=[],
+                 mode="sender"):
+        self.manager = manager
+        self.params = params
+        self.success_callback = success_callback
+        self.failure_callback = failure_callback
+        self.tls_whitelist = tls_whitelist
+        self.mode = mode
+
 class JMClientProtocolFactory(protocol.ClientFactory):
     protocol = JMTakerClientProtocol
 
@@ -517,40 +767,84 @@ class JMClientProtocolFactory(protocol.ClientFactory):
     def buildProtocol(self, addr):
         return self.protocol(self, self.client)
 
-def start_reactor(host, port, factory, ish=True, daemon=False, rs=True,
-                  gui=False): #pragma: no cover
+def start_reactor(host, port, factory=None, snickerfactory=None,
+                  bip78=False, jm_coinjoin=True, ish=True,
+                  daemon=False, rs=True, gui=False): #pragma: no cover
     #(Cannot start the reactor in tests)
     #Not used in prod (twisted logging):
     #startLogging(stdout)
-    usessl = True if jm_single().config.get("DAEMON", "use_ssl") != 'false' else False
+    usessl = True if jm_single().config.get("DAEMON",
+                                            "use_ssl") != 'false' else False
+
+    jmcport, snickerport, bip78port = [port]*3
     if daemon:
         try:
-            from jmdaemon import JMDaemonServerProtocolFactory, start_daemon
+            from jmdaemon import JMDaemonServerProtocolFactory, start_daemon, \
+                 SNICKERDaemonServerProtocolFactory, BIP78ServerProtocolFactory
         except ImportError:
             jlog.error("Cannot start daemon without jmdaemon package; "
                        "either install it, and restart, or, if you want "
                        "to run the daemon separately, edit the DAEMON "
                        "section of the config. Quitting.")
             return
-        dfactory = JMDaemonServerProtocolFactory()
-        orgport = port
-        while True:
-            try:
-                start_daemon(host, port, dfactory, usessl,
-                             './ssl/key.pem', './ssl/cert.pem')
-                jlog.info("Listening on port " + str(port))
-                break
-            except Exception:
-                jlog.warn("Cannot listen on port " + str(port) + ", trying next port")
-                if port >= (orgport + 100):
-                    jlog.error("Tried 100 ports but cannot listen on any of them. Quitting.")
-                    sys.exit(EXIT_FAILURE)
-                port += 1
+        if jm_coinjoin:
+            dfactory = JMDaemonServerProtocolFactory()
+        if snickerfactory:
+            sdfactory = SNICKERDaemonServerProtocolFactory()
+        if bip78:
+            bip78factory = BIP78ServerProtocolFactory()
+        # ints are immutable in python, to pass by ref we use
+        # an array object:
+        port_a = [port]
+        def start_daemon_on_port(p, f, name, port_offset):
+            orgp = p[0]
+            while True:
+                try:
+                    start_daemon(host, p[0] - port_offset, f, usessl,
+                        './ssl/key.pem', './ssl/cert.pem')
+                    jlog.info("{} daemon listening on port {}".format(
+                        name, str(p[0] - port_offset)))
+                    break
+                except Exception:
+                    jlog.warn("Cannot listen on port " + str(
+                        p[0] - port_offset) + ", trying next port")
+                    if p[0] >= (orgp + 100):
+                        jlog.error("Tried 100 ports but cannot "
+                                   "listen on any of them. Quitting.")
+                        sys.exit(EXIT_FAILURE)
+                    p[0] += 1
+            return p[0]
+
+        if jm_coinjoin:
+            # TODO either re-apply this port incrementing logic
+            # to other protocols, or re-work how the ports work entirely.
+            jmcport = start_daemon_on_port(port_a, dfactory, "Joinmarket", 0)
+        # (See above) For now these other two are just on ports that are 1K offsets.
+        if snickerfactory:
+            snickerport = start_daemon_on_port(port_a, sdfactory, "SNICKER", 1000)
+        if bip78:
+            bip78port = start_daemon_on_port(port_a, bip78factory, "BIP78", 2000)
+
+        # if the port had to be incremented due to conflict above, we should update
+        # it in the config var so e.g. bip78 connections choose the port we actually
+        # used.
+        # This is specific to the daemon-in-same-process case; for the external daemon
+        # the user must just set the right value.
+        jm_single().config.set("DAEMON", "daemon_port", str(port_a[0]))
+
+    # Note the reactor.connect*** entries do not include BIP78 which
+    # starts in jmclient.payjoin:
     if usessl:
-        ctx = ClientContextFactory()
-        reactor.connectSSL(host, port, factory, ctx)
+        if factory:
+            reactor.connectSSL(host, jmcport, factory, ClientContextFactory())
+        if snickerfactory:
+            reactor.connectSSL(host, snickerport, snickerfactory,
+                           ClientContextFactory())
     else:
-        reactor.connectTCP(host, port, factory)
+        if factory:
+            reactor.connectTCP(host, jmcport, factory)
+        if snickerfactory:
+            reactor.connectTCP(host, snickerport, snickerfactory)
     if rs:
         if not gui:
             reactor.run(installSignalHandlers=ish)

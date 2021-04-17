@@ -7,11 +7,12 @@ import abc
 from twisted.python.log import startLogging
 from optparse import OptionParser
 from jmbase import get_log
-from jmclient import Maker, jm_single, load_program_config, \
-    JMClientProtocolFactory, start_reactor, calc_cj_fee, \
-    WalletService, add_base_options
+from jmclient import (Maker, jm_single, load_program_config,
+                      JMClientProtocolFactory, start_reactor, calc_cj_fee,
+                      WalletService, add_base_options, SNICKERReceiver,
+                      SNICKERClientProtocolFactory)
 from .wallet_utils import open_test_wallet_maybe, get_wallet_path
-from jmbase.support import EXIT_ARGERROR, EXIT_FAILURE
+from jmbase.support import EXIT_ARGERROR, EXIT_FAILURE, get_jm_version_str
 
 jlog = get_log()
 
@@ -26,6 +27,7 @@ class YieldGenerator(Maker):
 
     def __init__(self, wallet_service):
         Maker.__init__(self, wallet_service)
+        jlog.info(get_jm_version_str())
         self.tx_unconfirm_timestamp = {}
         self.statement_file = os.path.join(jm_single().datadir,
                                       'logs', 'yigen-statement.csv')
@@ -310,11 +312,23 @@ def ygmain(ygclass, nickserv_password='', gaplimit=6):
                              cjfee_factor, size_factor])
     jlog.info('starting yield generator')
     clientfactory = JMClientProtocolFactory(maker, proto_type="MAKER")
-
+    if jm_single().config.get("SNICKER", "enabled") == "true":
+        if jm_single().config.get("BLOCKCHAIN", "network") == "mainnet":
+            jlog.error("You have enabled SNICKER on mainnet, this is not "
+                       "yet supported for yieldgenerators; either use "
+                       "signet/regtest/testnet, or run SNICKER manually "
+                       "with snicker/receive-snicker.py.")
+            sys.exit(EXIT_ARGERROR)
+        snicker_r = SNICKERReceiver(wallet_service)
+        servers = jm_single().config.get("SNICKER", "servers").split(",")
+        snicker_factory = SNICKERClientProtocolFactory(snicker_r, servers)
+    else:
+        snicker_factory = None
     nodaemon = jm_single().config.getint("DAEMON", "no_daemon")
     daemon = True if nodaemon == 1 else False
     if jm_single().config.get("BLOCKCHAIN", "network") in ["regtest", "testnet", "signet"]:
         startLogging(sys.stdout)
     start_reactor(jm_single().config.get("DAEMON", "daemon_host"),
                       jm_single().config.getint("DAEMON", "daemon_port"),
-                      clientfactory, daemon=daemon)
+                      clientfactory, snickerfactory=snicker_factory,
+                      daemon=daemon)

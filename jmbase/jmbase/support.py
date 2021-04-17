@@ -1,13 +1,15 @@
 
 import logging, sys
 import binascii
+import random
 from getpass import getpass
 from os import path, environ
 from functools import wraps
 from optparse import IndentedHelpFormatter
+import urllib.parse as urlparse
 
 # JoinMarket version
-JM_CORE_VERSION = '0.8.2dev'
+JM_CORE_VERSION = '0.8.3dev'
 
 # global Joinmarket constants
 JM_WALLET_NAME_PREFIX = "joinmarket-wallet-"
@@ -221,8 +223,11 @@ def lookup_appdata_folder(appname):
         data_folder = path.expanduser(path.join("~", "." + appname + "/"))
     return data_folder
 
+def get_jm_version_str():
+    return "JoinMarket " + JM_CORE_VERSION
+
 def print_jm_version(option, opt_str, value, parser):
-    print("JoinMarket " + JM_CORE_VERSION)
+    print(get_jm_version_str())
     sys.exit(EXIT_SUCCESS)
 
 # helper functions for conversions of format between over-the-wire JM
@@ -288,3 +293,43 @@ def hexbin(func):
         return func(inst, *newargs, **kwargs)
 
     return func_wrapper
+
+def wrapped_urlparse(url):
+    """ This wrapper is unfortunately necessary as there appears
+    to be a bug in the urlparse handling of *.onion strings:
+    If http:// is prepended, the url parses correctly, but if it
+    is not, the .hostname property is erroneously None.
+    """
+    if isinstance(url, str):
+        a, b = (".onion", "http://")
+    else:
+        a, b = (b".onion", b"http://")
+    if url.endswith(a) and not url.startswith(b):
+        url = b + url
+    return urlparse.urlparse(url)
+
+def bdict_sdict_convert(d, output_binary=False):
+    """ Useful for converting dicts from url parameter sets
+    to a form that can be handled by json dumps/loads.
+    This code only works if *all* keys in the dict
+    are binary strings, and all values are lists of same.
+    This code could be extended if needed.
+    If output_binary is True, the reverse operation is performed.
+    """
+    newd = {}
+    for k, v in d.items():
+        if output_binary:
+            newv = [a.encode("utf-8") for a in v]
+            newd[k.encode("utf-8")] = newv
+        else:
+            newv = [a.decode("utf-8") for a in v]
+            newd[k.decode("utf-8")] = newv
+    return newd
+
+def random_insert(old, new):
+    """ Insert elements of new at random indices in
+    the old list, without changing the ordering of the old list.
+    """
+    for n in new:
+        insertion_index = random.randint(0, len(old))
+        old[:] = old[:insertion_index] + [n] + old[insertion_index:]

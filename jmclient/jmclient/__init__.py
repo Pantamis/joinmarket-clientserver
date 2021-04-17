@@ -24,11 +24,13 @@ from .configure import (load_test_config, process_shutdown,
     load_program_config, jm_single, get_network, update_persist_config,
     validate_address, is_burn_destination, get_irc_mchannels,
     get_blockchain_interface_instance, set_config, is_segwit_mode,
-    is_native_segwit_mode)
+    is_native_segwit_mode, JMPluginService)
 from .blockchaininterface import (BlockchainInterface,
                                   RegtestBitcoinCoreInterface, BitcoinCoreInterface)
+from .snicker_receiver import SNICKERError, SNICKERReceiver
 from .client_protocol import (JMTakerClientProtocol, JMClientProtocolFactory,
-                              start_reactor)
+                              start_reactor, SNICKERClientProtocolFactory,
+                              BIP78ClientProtocolFactory)
 from .podle import (set_commitment_file, get_commitment_file,
                     add_external_commitments,
                     PoDLE, generate_podle, get_podle_commitments,
@@ -55,8 +57,7 @@ from .wallet_utils import (
 from .wallet_service import WalletService
 from .maker import Maker
 from .yieldgenerator import YieldGenerator, YieldGeneratorBasic, ygmain
-from .snicker_receiver import SNICKERError, SNICKERReceiver
-from .payjoin import (parse_payjoin_setup, send_payjoin, PayjoinServer,
+from .payjoin import (parse_payjoin_setup, send_payjoin,
                       JMBIP78ReceiverManager)
 # Set default logging handler to avoid "No handler found" warnings.
 

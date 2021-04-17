@@ -3,12 +3,11 @@
 from optparse import OptionParser
 
 import sys
-from twisted.python.log import startLogging
 from twisted.internet import reactor
-from jmbase import get_log, set_logging_level, jmprint
+from jmbase import get_log, jmprint
 from jmclient import jm_single, load_program_config, \
     WalletService, open_test_wallet_maybe, get_wallet_path, check_regtest, \
-    add_base_options, JMBIP78ReceiverManager
+    add_base_options, JMBIP78ReceiverManager, start_reactor
 from jmbase.support import EXIT_FAILURE, EXIT_ARGERROR
 from jmbitcoin import amount_to_sat
 jlog = get_log()
@@ -64,14 +63,19 @@ def receive_payjoin_main():
     wallet_service.startService()
     # having enforced wallet sync, we can check if we have coins
     # to do payjoin in the mixdepth
-    if wallet_service.get_balance_by_mixdepth()[options.mixdepth] == 0:
+    if wallet_service.get_balance_by_mixdepth(minconfs=1)[options.mixdepth] == 0:
         jlog.error("Cannot do payjoin from mixdepth " + str(
-            options.mixdepth) + ", no coins. Shutting down.")
+            options.mixdepth) + ", no confirmed coins. Shutting down.")
         sys.exit(EXIT_ARGERROR)
     receiver_manager = JMBIP78ReceiverManager(wallet_service, options.mixdepth,
                                     bip78_amount, options.hsport)
-    receiver_manager.start_pj_server_and_tor()
-    reactor.run()
+    reactor.callWhenRunning(receiver_manager.initiate)
+    nodaemon = jm_single().config.getint("DAEMON", "no_daemon")
+    daemon = True if nodaemon == 1 else False
+    dhost = jm_single().config.get("DAEMON", "daemon_host")
+    dport = jm_single().config.getint("DAEMON", "daemon_port")
+    # JM is default, so must be switched off explicitly in this call:
+    start_reactor(dhost, dport, bip78=True, jm_coinjoin=False, daemon=daemon)
 
 if __name__ == "__main__":
     receive_payjoin_main()

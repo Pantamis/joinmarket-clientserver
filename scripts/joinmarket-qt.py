@@ -37,8 +37,6 @@ elif platform.system() == 'Darwin':
 else:
     MONOSPACE_FONT = 'monospace'
 
-import jmbitcoin as btc
-
 # This is required to change the decimal separator
 # to '.' regardless of the locale; TODO don't require
 # this, but will require other edits for parsing amounts.
@@ -58,11 +56,12 @@ donation_address_sw = "bc1q5x02zqj5nshw0yhx2s4tj75z6vkvuvww26jak5"
 donation_address_url = "https://bitcoinprivacy.me/joinmarket-donations"
 
 #Version of this Qt script specifically
-JM_GUI_VERSION = '20dev'
+JM_GUI_VERSION = '21dev'
 
 from jmbase import get_log, stop_reactor
 from jmbase.support import DUST_THRESHOLD, EXIT_FAILURE, utxo_to_utxostr,\
-    bintohex, hextobin, JM_CORE_VERSION
+    hextobin, JM_CORE_VERSION
+import jmbitcoin as btc
 from jmclient import load_program_config, get_network, update_persist_config,\
     open_test_wallet_maybe, get_wallet_path,\
     jm_single, validate_address, weighted_order_choose, Taker,\
@@ -73,7 +72,7 @@ from jmclient import load_program_config, get_network, update_persist_config,\
     wallet_generate_recover_bip39, wallet_display, get_utxos_enabled_disabled,\
     NO_ROUNDING, get_max_cj_fee_values, get_default_max_absolute_fee, \
     get_default_max_relative_fee, RetryableStorageError, add_base_options, \
-    BTCEngine, BTC_P2SH_P2WPKH, FidelityBondMixin, wallet_change_passphrase, \
+    BTCEngine, FidelityBondMixin, wallet_change_passphrase, \
     parse_payjoin_setup, send_payjoin, JMBIP78ReceiverManager
 from qtsupport import ScheduleWizard, TumbleRestartWizard, config_tips,\
     config_types, QtHandler, XStream, Buttons, OkButton, CancelButton,\
@@ -292,6 +291,8 @@ class SpendTab(QWidget):
         self.spendstate.reset() #trigger callback to 'ready' state
         # needed to be saved for parse_payjoin_setup()
         self.bip21_uri = None
+        # avoid re-starting BIP78 daemon unnecessarily:
+        self.bip78_daemon_started = False
 
     def switchToBIP78Payjoin(self, endpoint_url):
         self.numCPLabel.setVisible(False)
@@ -746,7 +747,18 @@ class SpendTab(QWidget):
 
         if bip78url:
             manager = parse_payjoin_setup(self.bip21_uri,
-                mainWindow.wallet_service, mixdepth, "joinmarket-qt")
+                    mainWindow.wallet_service, mixdepth, "joinmarket-qt")
+            # start BIP78 AMP protocol if not yet up:
+            if not self.bip78_daemon_started:
+                daemon = jm_single().config.getint("DAEMON", "no_daemon")
+                daemon = True if daemon == 1 else False
+                start_reactor(jm_single().config.get("DAEMON", "daemon_host"),
+                       jm_single().config.getint("DAEMON", "daemon_port"),
+                       bip78=True, jm_coinjoin=False,
+                       ish=False,
+                       daemon=daemon,
+                       gui=True)
+                self.bip78_daemon_started = True
             # disable form fields until payment is done
             self.addressInput.setEnabled(False)
             self.pjEndpointInput.setEnabled(False)
@@ -836,7 +848,7 @@ class SpendTab(QWidget):
             self.clientfactory = JMClientProtocolFactory(self.taker)
             daemon = jm_single().config.getint("DAEMON", "no_daemon")
             daemon = True if daemon == 1 else False
-            start_reactor("localhost",
+            start_reactor(jm_single().config.get("DAEMON", "daemon_host"),
                    jm_single().config.getint("DAEMON", "daemon_port"),
                    self.clientfactory,
                    ish=False,
@@ -1458,6 +1470,9 @@ class JMMainWindow(QMainWindow):
         # BIP 78 Receiver manager object, only
         # created when user starts a payjoin event:
         self.backend_receiver = None
+        # Keep track of whether the BIP78 daemon has
+        # been started, to avoid unnecessary duplication:
+        self.bip78daemon = False
 
         self.reactor = reactor
         self.initUI()
@@ -1550,16 +1565,29 @@ class JMMainWindow(QMainWindow):
                            "Wallet does not have mixdepth " + str(mixdepth),
                            mbtype='crit', title="Error")
             return False
-        if self.wallet_service.get_balance_by_mixdepth()[mixdepth] == 0:
+        if self.wallet_service.get_balance_by_mixdepth(minconfs=1)[mixdepth] == 0:
             JMQtMessageBox(self, "Mixdepth " + str(mixdepth) + \
-                           " has no coins.", mbtype='crit', title="Error")
+                           " has no confirmed coins.",
+                           mbtype='crit', title="Error")
             return False
         self.backend_receiver = JMBIP78ReceiverManager(self.wallet_service,
             mixdepth, amount, 80, self.receiver_bip78_dialog.info_update,
             uri_created_callback=self.receiver_bip78_dialog.update_uri,
             shutdown_callback=self.receiver_bip78_dialog.process_complete,
             mode="gui")
-        self.backend_receiver.start_pj_server_and_tor()
+        if not self.bip78daemon:
+            #First run means we need to start: create daemon;
+            # the client and its connection are created in the .initiate()
+            # call.
+            daemon = jm_single().config.getint("DAEMON", "no_daemon")
+            if daemon:
+                # this call not needed if daemon is external.
+                start_reactor(jm_single().config.get("DAEMON", "daemon_host"),
+                       jm_single().config.getint("DAEMON", "daemon_port"),
+                       jm_coinjoin=False, bip78=True, daemon=True,
+                       gui=True, rs=False)
+                self.bip78daemon = True
+        self.backend_receiver.initiate()
         return True
 
     def stopReceiver(self):

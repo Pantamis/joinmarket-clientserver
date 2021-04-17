@@ -228,3 +228,152 @@ class JMTXBroadcast(JMCommand):
     broadcast.
     """
     arguments = [(b'txhex', Unicode())]
+
+"""SNICKER related commands.
+"""
+
+class SNICKERReceiverInit(JMCommand):
+    """ Initialization data for a SNICKER service.
+    See documentation of `netconfig` in
+    jmdaemon.HTTPPassThrough.on_INIT
+    """
+    arguments = [(b'netconfig', Unicode())]
+
+class SNICKERProposerInit(JMCommand):
+    """ As for receiver.
+    """
+    arguments = [(b'netconfig', Unicode())]
+
+class SNICKERReceiverUp(JMCommand):
+    arguments = []
+
+class SNICKERProposerUp(JMCommand):
+    arguments = []
+
+class SNICKERReceiverGetProposals(JMCommand):
+    arguments = []
+
+class SNICKERReceiverProposals(JMCommand):
+    """ Sends the retrieved proposal list from
+    a specific server, from daemon back to client.
+    """
+    arguments = [(b'proposals', BigUnicode()),
+                 (b'server', Unicode())]
+
+class SNICKERProposerPostProposals(JMCommand):
+    """ Sends a list of proposals to be uploaded
+    to a server.
+    """
+    arguments = [(b'proposals', BigUnicode()),
+                 (b'server', Unicode())]
+
+class SNICKERProposalsServerResponse(JMCommand):
+    arguments = [(b'response', Unicode()),
+                 (b'server', Unicode())]
+
+class SNICKERServerError(JMCommand):
+    arguments = [(b'server', Unicode()),
+                 (b'errorcode', Integer())]
+
+class SNICKERRequestPowTarget(JMCommand):
+    arguments = [(b'server', Unicode())]
+
+class SNICKERReceivePowTarget(JMCommand):
+    arguments = [(b'server', Unicode()),
+                 (b'targetbits', Integer())]
+
+""" Payjoin-related commands
+"""
+
+""" Sender-specific commands.
+"""
+
+class BIP78SenderInit(JMCommand):
+    """ Initialization data for a BIP78 service.
+    See documentation of `netconfig` in
+    jmdaemon.HTTPPassThrough.on_INIT
+    """
+    arguments = [(b'netconfig', Unicode())]
+
+class BIP78SenderUp(JMCommand):
+    arguments = []
+
+class BIP78SenderOriginalPSBT(JMCommand):
+    """ Sends the payjoin url and the original
+    payment PSBT, base64 encoded,
+    from the client to the daemon,
+    to be sent as an http request to the receiver.
+    """
+    arguments = [(b'body', BigUnicode()),
+                 (b'params', Unicode())]
+
+class BIP78SenderReceiveProposal(JMCommand):
+    """ Sends the payjoin proposal PSBT, received
+    from the BIP78 Receiver, from the daemon to the client.
+    """
+    arguments = [(b'psbt', BigUnicode())]
+
+class BIP78SenderReceiveError(JMCommand):
+    """ Sends a message from daemon to client
+    indicating that the BIP78 receiver did not
+    accept the request, or there was a network error.
+    """
+    arguments = [(b'errormsg', Unicode()),
+                 (b'errorcode', Integer())]
+
+""" Receiver-specific commands
+"""
+
+class BIP78ReceiverInit(JMCommand):
+    """ Initialization data for a BIP78 hidden service.
+    """
+    arguments = [(b'netconfig', Unicode())]
+
+class BIP78ReceiverUp(JMCommand):
+    """ Returns onion hostname to client when
+    the hidden service has been brought up, indicating
+    readiness.
+    """
+    arguments = [(b'hostname', Unicode())]
+
+class BIP78ReceiverOriginalPSBT(JMCommand):
+    """ Sends the sender's original
+    payment PSBT, base64 encoded, and the request
+    parameters in the url, from the daemon to the client.
+    """
+    arguments = [(b'body', BigUnicode()),
+                 (b'params', Unicode())]
+
+class BIP78ReceiverSendProposal(JMCommand):
+    """ Receives a payjoin proposal PSBT from
+    the client, sent to the daemon.
+    """
+    arguments = [(b'psbt', BigUnicode())]
+
+class BIP78ReceiverSendError(JMCommand):
+    """ Sends a message from client to daemon
+    indicating that the BIP78 receiver did not
+    accept the request, to be forwarded to the sender.
+    """
+    arguments = [(b'errormsg', Unicode()),
+                 (b'errorcode', Unicode())]
+
+class BIP78ReceiverHiddenServiceShutdown(JMCommand):
+    """ Sends a message from the daemon to the
+    client when the hidden service has shut down.
+    """
+    arguments = []
+
+class BIP78ReceiverOnionSetupFailed(JMCommand):
+    """ Sends a message from the daemon to the
+    client when the hidden service setup failed
+    for the given reason.
+    """
+    arguments = [(b'reason', Unicode())]
+
+class BIP78InfoMsg(JMCommand):
+    """ Sends an info message to the client
+    from the daemon about current status at
+    network level.
+    """
+    arguments = [(b'infomsg', Unicode())]

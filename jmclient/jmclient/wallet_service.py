@@ -2,7 +2,6 @@
 
 import collections
 import time
-import ast
 import sys
 from decimal import Decimal
 from copy import deepcopy
@@ -10,14 +9,14 @@ from twisted.internet import reactor
 from twisted.internet import task
 from twisted.application.service import Service
 from numbers import Integral
+import jmbitcoin as btc
 from jmclient.configure import jm_single, get_log
 from jmclient.output import fmt_tx_data
 from jmclient.blockchaininterface import (INF_HEIGHT, BitcoinCoreInterface,
     BitcoinCoreNoHistoryInterface)
 from jmclient.wallet import FidelityBondMixin, BaseWallet
-from jmbase import stop_reactor
-from jmbase.support import jmprint, EXIT_SUCCESS, utxo_to_utxostr, hextobin
-
+from jmbase import (stop_reactor, hextobin, utxo_to_utxostr,
+                    jmprint, EXIT_SUCCESS)
 
 """Wallet service
 
@@ -636,7 +635,7 @@ class WalletService(Service):
             path = self.wallet.get_path(mixdepth, address_type, index)
             path_privkey, engine = self.wallet._get_key_from_path(path)
             path_pubkey = engine.privkey_to_pubkey(path_privkey)
-            path_pubkeyhash = btc.bin_hash160(path_pubkey)
+            path_pubkeyhash = btc.Hash160(path_pubkey)
             for burner_tx in burner_txes:
                 burner_pubkeyhash, gettx = burner_tx
                 if burner_pubkeyhash != path_pubkeyhash:
@@ -663,6 +662,45 @@ class WalletService(Service):
 
         self.wallet.set_next_index(mixdepth, address_type, highest_used_index + 1)
 
+    def get_all_transactions(self):
+        """ Get all transactions (spending or receiving) that
+        are currently recorded by our blockchain interface as relating
+        to this wallet, as a list.
+        """
+        res = []
+        processed_txids = []
+        for r in self.bci._yield_transactions(
+            self.get_wallet_name()):
+            txid = r["txid"]
+            if txid not in processed_txids:
+                tx = self.bci.get_transaction(hextobin(txid))
+                res.append(self.bci.get_deser_from_gettransaction(tx))
+                processed_txids.append(txid)
+        return res
+
+    def get_transaction(self, txid):
+        """ If the transaction for txid is an in-wallet
+        transaction, will return a CTransaction object for it;
+        if not, will return None.
+        """
+        tx = self.bci.get_transaction(txid)
+        if not tx:
+            return None
+        return self.bci.get_deser_from_gettransaction(tx)
+
+    def get_block_height(self, blockhash):
+        return self.bci.get_block_height(blockhash)
+
+    def get_transaction_block_height(self, tx):
+        """ Given a CTransaction object tx, return
+        the block height at which it was mined, or False
+        if it is not found in the blockchain (including if
+        it is not a wallet tx and so can't be queried).
+        """
+        txid = tx.GetTxid()[::-1]
+        return self.get_block_height(self.bci.get_transaction(
+            txid)["blockhash"])
+
     def sync_addresses(self):
         """ Triggered by use of --recoversync option in scripts,
         attempts a full scan of the blockchain without assuming
@@ -686,15 +724,15 @@ class WalletService(Service):
                 if tx['category'] == 'receive':
                     tx_receive.append(tx)
                 elif tx["category"] == "send":
-                    gettx = self.bci.get_transaction(tx["txid"])
+                    gettx = self.bci.get_transaction(hextobin(tx["txid"]))
                     txd = self.bci.get_deser_from_gettransaction(gettx)
-                    if len(txd["outs"]) > 1:
+                    if len(txd.vout) > 1:
                         continue
                     #must be mined into a block to sync
                     #otherwise there's no merkleproof or block index
                     if gettx["confirmations"] < 1:
                         continue
-                    script = binascii.unhexlify(txd["outs"][0]["script"])
+                    script = txd.vout[0].scriptPubKey
                     if script[0] != 0x6a: #OP_RETURN
                         continue
                     pubkeyhash = script[2:]
