@@ -33,6 +33,7 @@ class Taker(object):
                  order_chooser=weighted_order_choose,
                  callbacks=None,
                  tdestaddrs=None,
+                 custom_change_address=None,
                  ignored_makers=None):
         """`schedule`` must be a list of tuples: (see sample_schedule_for_testnet
         for explanation of syntax, also schedule.py module in this directory),
@@ -84,6 +85,7 @@ class Taker(object):
         self.schedule = schedule
         self.order_chooser = order_chooser
         self.max_cj_fee = max_cj_fee
+        self.custom_change_address = custom_change_address
 
         #List (which persists between transactions) of makers
         #who have not responded or behaved maliciously at any
@@ -288,13 +290,15 @@ class Taker(object):
         if not self.my_cj_addr:
             #previously used for donations; TODO reimplement?
             raise NotImplementedError
-        self.my_change_addr = None
         if self.cjamount != 0:
-            try:
-                self.my_change_addr = self.wallet_service.get_internal_addr(self.mixdepth)
-            except:
-                self.taker_info_callback("ABORT", "Failed to get a change address")
-                return False
+            if self.custom_change_address:
+                self.my_change_addr = self.custom_change_address
+            else:
+                try:
+                    self.my_change_addr = self.wallet_service.get_internal_addr(self.mixdepth)
+                except:
+                    self.taker_info_callback("ABORT", "Failed to get a change address")
+                    return False
             #adjust the required amount upwards to anticipate an increase in
             #transaction fees after re-estimation; this is sufficiently conservative
             #to make failures unlikely while keeping the occurence of failure to
@@ -314,6 +318,7 @@ class Taker(object):
         else:
             #sweep
             self.input_utxos = self.wallet_service.get_utxos_by_mixdepth()[self.mixdepth]
+            self.my_change_addr = None
             #do our best to estimate the fee based on the number of
             #our own utxos; this estimate may be significantly higher
             #than the default set in option.txfee * makercount, where
@@ -485,16 +490,16 @@ class Taker(object):
         #we have tried to avoid this based on over-estimating the needed amount
         #in SendPayment.create_tx(), but it is still a possibility if one maker
         #uses a *lot* of inputs.
-        if self.my_change_addr and my_change_value <= 0:
-            raise ValueError("Calculated transaction fee of: " +
-                btc.amount_to_str(self.total_txfee) +
-                " is too large for our inputs; Please try again.")
-        elif self.my_change_addr and my_change_value <= jm_single(
-        ).BITCOIN_DUST_THRESHOLD:
-            jlog.info("Dynamically calculated change lower than dust: " +
-                btc.amount_to_str(my_change_value) + "; dropping.")
-            self.my_change_addr = None
-            my_change_value = 0
+        if self.my_change_addr:
+            if my_change_value < -1:
+                raise ValueError("Calculated transaction fee of: " +
+                    btc.amount_to_str(self.total_txfee) +
+                    " is too large for our inputs; Please try again.")
+            if my_change_value <= jm_single().BITCOIN_DUST_THRESHOLD:
+                jlog.info("Dynamically calculated change lower than dust: " +
+                    btc.amount_to_str(my_change_value) + "; dropping.")
+                self.my_change_addr = None
+                my_change_value = 0
         jlog.info(
             'fee breakdown for me totalin=%d my_txfee=%d makers_txfee=%d cjfee_total=%d => changevalue=%d'
             % (my_total_in, my_txfee, self.maker_txfee_contributions,

@@ -68,7 +68,7 @@ If you are looking for the available makers, run the [orderbook](docs/orderbook.
 
 ### PayJoin
 
-If you want to use the PayJoin feature to pay/receive money to/from another Joinmarket wallet user, read [this guide](docs/PAYJOIN.md).
+If you want to use the PayJoin feature to pay/receive money to/from another [BIP78]((https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki))-supporting wallet, read [this guide](docs/PAYJOIN.md).
 
 ### Joinmarket-Qt
 
@@ -94,9 +94,9 @@ Instructions for developers for testing [here](docs/TESTING.md). If you want to 
 
 ### Community
 
-+ IRC: `#joinmarket` on irc.freenode.net https://webchat.freenode.net/?channels=%23joinmarket (logs can be found [here](http://gnusha.org/joinmarket/))
++ IRC: `#joinmarket` on irc.libera.chat https://kiwiirc.com/nextclient/irc.libera.chat#joinmarket (logs can be found [here](http://gnusha.org/joinmarket/))
 
-+ IRC on tor: `#joinmarket` on the networks [Hackint](https://www.hackint.org/) and [Darkscience](https://www.darkscience.net/). These channels are bridged to the above freenode channel.
++ IRC on tor: `#joinmarket` on [Hackint](https://www.hackint.org/). This channel is bridged to the above Libera Chat channel.
 
 + Bitcoin wiki page: https://en.bitcoin.it/wiki/JoinMarket
 
@@ -114,5 +114,3 @@ Donate to help make JoinMarket even better: [Obtain a bitcoin address here](http
 
 JoinMarket is an open source project which does not have a funding model, fortunately the project itself has very low running costs as it is almost-fully decentralized and available to everyone for free. Developers contribute only as volunteers and donations are divided amongst them. Many developers have also been important in advocating for privacy and educating the wider bitcoin user base. Be part of the effort to improve bitcoin privacy and fungibility. Every donated coin helps us spend more time on JoinMarket instead of doing other stuff.
 
-Old donation addresses: `bc1q5x02zqj5nshw0yhx2s4tj75z6vkvuvww26jak5` or `1AZgQZWYRteh6UyF87hwuvyWj73NvWKpL`. Signatures can be found [here](docs/signed-donation-address.txt).
-Ideally use the above https link to obtain a brand new address.
